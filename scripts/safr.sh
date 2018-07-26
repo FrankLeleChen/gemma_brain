@@ -1,0 +1,1 @@
+module load plink; chr=$PBS_ARRAYID; ls bfiles/* | grep safr | grep chr"$chr"_ | grep .bed | sed 's/.bed//g' | awk '{print $1".bed",$1".bim",$1".fam"}'    > mlist_$chr ; plink --merge-list  mlist_$chr --make-bed --out bfiles2/safr_bgn__chr$chr; 

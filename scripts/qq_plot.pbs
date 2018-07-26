@@ -1,0 +1,15 @@
+#!/bin/bash
+
+while getopts s:i:o:e: option
+do
+  case "${option}"
+    in
+      s) scriptname=${OPTARG};;
+      i) indata=${OPTARG};;
+      o) outdata=${OPTARG};;
+      e) errorbars=${OPTARG};;
+    esac
+done
+
+
+/usr/local/lib64/R/bin/Rscript $scriptname $indata $outdata $errorbars 

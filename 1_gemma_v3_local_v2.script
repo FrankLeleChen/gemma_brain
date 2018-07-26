@@ -1,0 +1,257 @@
+
+##Step 2: Given that all studies have been merged (or that there is just one study)
+ 
+#Specify study name code
+ study=$sname
+
+#Specify working directory (results and stuff go here). Put gemma binary in here!
+ workingdir=/home/maihofer/raj
+ cd $workingdir
+ 
+#Gemma binary 
+ #is assumed to be in working directory
+
+#PLINK binary location
+ ploc=/home/maihofer/katy/plink
+ 
+#QCed PLINK data path
+ bfile_path=/home/maihofer/raj/merged_genotypes_allchr
+
+#QCed PLINK data name. PLINK data should be imputed and all chromosomes/segments merged together.
+ bfile=$study 
+
+
+#Location of genotype data
+ outdir_mgeno="$workingdir"/merged_genotypes
+
+####Phenotype file creation: This part is not computationally intensitive. It could be run on a desktop/login node in no time.
+
+
+#If this analysis is going to be done in a subset of samples, e.g. just European ancestry samples, we'll need a list of their plink IDs.
+#In this case I'm doing European ancestry subjects
+#Example here: Based on predpc file, make a file of all ancestry information, to extract a list of all european sample IDs. 
+#If you don't have this file, but know ancestry, supply a list of FID and IIDs (one row per subject) of the european ancestry (or whatever) subjects
+ echo "FID IID" > european.header
+ cat /home/maihofer/katy/famanc/*.predpc | awk '{if ($15 == "eur") print $1,$2}'  | cat european.header - > european.subjects
+
+###Make a phenotype/covar file. 
+
+##If you don't want to include specific subjects, provide a phenotype file with them excluded (not NA valued, actually excluded!)
+#Their phenotype will be set to NA, which will de-facto remove them from analysis
+
+#Make list of all subjects in the order which they were put into the GRM. This should just be the first two columns of the plink .fam file that was used to make the GRM
+
+ awk '{print $1,$2}' "$bfile_path"/"$bfile".fam > "$bfile".subjects 
+
+#Get sex and phenotype from the .fam file. Here it's PTSD, could be anything
+ echo "FID IID Sex PTSD" > covar.header
+ awk '{print $1,$2, $5, $6}' "$bfile_path"/"$bfile".fam | cat covar.header - > "$bfile".covs 
+
+#List of subjects. Must be in same order as subjects were input into GRM (i.e. the .fam file used to make the GRM)
+ subjects="$bfile".subjects
+#IF specified, subset to include only this set of subjects, e.g. the list of european subjects
+ inclusions=european.subjects
+ 
+#Note: Assumes that all subjects have nonmissing values for all specified phenotypes!
+
+#Phenotype file name. Blank space delimited, with header including FID and IID
+ phenofile=hippocampal_v4b.pheno.txt
+#Comma delimited  list of phenos, lised phenos must be in data
+ phenolist=avgVent,avgthal,avgcaud,avgput,avgpal,avghippo,avgamyg,avgaccumb,ICV
+
+#If covariates included, covariate file name. Blank space delimited, with header, including FID and IID 
+#Very important that ALL SUBJECTS INCLUDED IN AN ANALYSIS have covariate data. NAs are unacceptable, GEMMA will segfault if there are NAs included in covariates
+ covfile=xxxx "$bfile".covs  # xxxx
+#List of covariates to include, separated by commas. Note covariates can alternatively just be in the phenotype sheet, they dont have to be separate files
+ covlist=xxxx # none ##Sex,ICV
+#Add study indicator covar by parsing ids.  Only use if analyzing multiple studies. Only works for ricopili style IDs (user will have to dummy code a study covar by hand otherwise), or data where study IDs are included study name, specifically in a name delimited by _, with studyid in the third entry.
+ studycov=FALSE
+#Output filename
+ outfile="$study".gemma
+
+ Rscript scripts/make_gemma_pheno.r $subjects $inclusions $phenofile $phenolist $covfile $covlist $studycov $outfile
+
+
+ #Check line counts of output, must all match
+ wc -l "$bfile_path"/"$bfile".fam 
+ wc -l "$study".gemma.pheno
+ wc -l "$study".gemma.covar
+
+####Everything below here is computationally intensive (if you're using a cluster, it's at this point you want to invoke it!)
+
+###Make leave out one chromosome (LOCO) GRMs. 
+
+#In this case, since we have a file for each CHR, we'll make a GRM for each chr, then Leave-one-out merge them
+
+#Estimate leave out chromosome GRMs in PLINK (same as GCTA grm)
+
+ if [ ! -d "errandout" ]; then
+   mkdir errandout
+ fi
+
+ if [ ! -d "grm" ]; then
+   mkdir grm
+ fi
+
+
+ nodeuse=4
+ totjobs=$(( (22 + $nodeuse - 1 ) / $nodeuse ))
+ outdir=grm
+ infile=$bfile
+ infilepath=$bfile_path
+  
+ for job in $(seq 1 1 $totjobs)
+ do
+  jstart=$((($job-1)*$nodeuse +1))
+  jstop=$(($job*$nodeuse))
+  for chr in  $(seq $jstart 1 $jstop)
+  do
+
+   echo $chr
+   awk -v chr=$chr '{if ($1 != chr) print $2}' "$infilepath"/"$infile".bim > grm/"$infile"_nochr"$chr".snplist
+
+   $ploc --bfile "$infilepath"/"$infile" --extract grm/"$infile"_nochr"$chr".snplist --autosome --make-rel square --out "$outdir"/"$infile"_nochr"$chr" --memory 2000 & 
+  done
+ wait # wait until set of jobs completes then keep going
+ done
+
+
+
+###GEMMA based LMM analysis
+
+#Location of genotype data to analyze. Should be split by chromosome!
+ ls $outdir_mgeno | grep .bed | sed 's/.bed//g' > doslistgemma_"$study".txt
+ gemmadir=$outdir_mgeno
+ 
+#Number of commands to run will be a function of the number of files
+ ncommands=$(wc -l doslistgemma_"$study".txt | awk '{print $1}' )
+
+#Make a job code, where 'nodesize' processes will run on each node (computer) simultaneously. If running on a desktop, set to a number less than or equal to the number of processors.
+ nodesize=16
+ nodeuse=$nodesize # $(($nodesize - 1))
+#Run this many jobs together at a given time
+ jobsize=16
+#Total number of jobs = Number of commands / number of commands used per job (i'll say to do 100 at a time), rounded up 
+ totjobs=$(( ($ncommands + $nodeuse - 1 ) / $jobsize + 1)) #I've just set it to 2, since this is by chromosome
+
+
+ 
+#Run gemma analysis for each imaging phenotype
+#MAKE SURE that pheno and covar files 
+for phenotypex in avgVent avgthal avgcaud avgput avgpal avghippo avgamyg avgaccumb
+do
+ pheno="$study".gemma."$phenotypex".pheno
+ covar="$study".gemma.covar
+
+ outname_append="$phenotypex"
+ echo "Analyzing $phenotypex"
+ 
+ for jobcount in $(seq 1 1 $totjobs)
+ do
+
+  chr=$jobcount
+  doselist=doslistgemma_"$study".txt
+  dosedir=$gemmadir
+  phenotype=$pheno
+  grm=grm/"$bfile"_nochr
+  covariate=$covar
+  outname=$outname_append
+  gxe=no
+  multivariate=no
+  PBS_ARRAYID=$chr
+  jobstart=$(($(($PBS_ARRAYID - 1))*$jobsize +1))
+  jobstop=$(($jobstart + $jobsize - 1 ))
+
+  max_jobs=$(wc -l $doselist | awk '{print $1}')
+
+   if [ $jobstop -ge $max_jobs ]
+   then
+    jobstop=$max_jobs
+   fi
+   
+   if [ $multivariate != "no" ]
+   then
+    extraparms="-n $multivariate"
+   fi
+   
+   if [ $gxe != "no" ]
+   then
+    extraparms_gxe="-gxe $gxe"
+   fi
+   
+   
+  for job in $(seq  $jobstart $nodeuse $jobstop)
+  do
+   jstart=$(($job))
+   jstop=$(($job+$nodeuse))
+   
+   if [ $jstop -ge $jobstop ]
+   then
+    jstop=$jobstop
+   fi
+   
+   for j in $(seq $jstart 1 $jstop)
+   do
+    file_use=$(awk -v lineno=$j '{if(NR==lineno) print}' $doselist)
+    grm_chr=$(echo $file_use | awk 'BEGIN{FS="_"} {print $2}' )
+    #mapfile=$(echo "$file_use"  | sed 's/.doscnt.gz/.mapfile.gz/g') 
+    
+    #only do analysis if the log file is incomplete, or if there is no log file
+    if [ -f output/"$file_use"_"$outname".log.txt ] 
+    then
+     if [ $(grep -c Computation  output/"$file_use"_"$outname".log.txt) -eq 0 ] 
+      then 
+      ./gemma -bfile "$dosedir"/"$file_use"  -p "$phenotype" -k "$grm""$grm_chr".rel -lmm 4 -maf $maf $extraparms $extraparms_gxe -c "$covariate" -o "$file_use"_"$outname" & 
+     fi
+    else
+      ./gemma -bfile "$dosedir"/"$file_use"  -p "$phenotype" -k "$grm""$grm_chr".rel -lmm 4 -maf $maf $extraparms $extraparms_gxe -c "$covariate" -o "$file_use"_"$outname" &
+    fi
+    
+    done
+   wait
+  done 
+
+
+ done
+
+done
+
+
+####This part is not computationally intensive, just manipulations of summary data
+
+###Process results data
+
+for phenotypex in avgVent avgthal avgcaud avgput avgpal avghippo avgamyg avgaccumb
+do
+ outname_append="$phenotypex"_"$outname_append1"
+#Combine gemma outputs
+ cat output/"$study"_*_"$outname_append".assoc.txt | awk '{if (NR == 1 || ($1 != "chr")) print}'  > "$study"_gemma_"$outname_append"
+ 
+#Split output for QQ and Manhattan plots
+ awk '{print $14}' "$study"_gemma_"$outname_append" | gzip > "$study"_gemma_"$outname_append".p.gz
+ awk '{if($14 <= 0.01) print $1,$2,$3,$14}' "$study"_gemma_"$outname_append" | gzip > "$study"_gemma_"$outname_append".mh.gz #Mh Plots are only done on markers with p < 0.01
+
+#User:Write input file here
+ infile="$study"_gemma_"$outname_append".mh.gz
+
+#User: Write output file name here
+ outfile="$study"_gemma_"$outname_append"
+
+#User: Write plot color here. Currently support blue, green, purple, red
+ color=blue
+
+#User: Write highlight-worthy p-value to highlight here
+ goodpv=5e-8
+
+#User: SNPs within this amount of BP of the highlighted SNP will also be highlighted
+ highlightbp=20000
+
+#Plot results
+ #qsub -lwalltime=00:25:00 scripts/mh_plot.pbs -e errandout/ -o errandout -d $workingdir -F "-s mh_plot_pgc_v2.R -m ManhattanPlotterFunction_colorfixed_max10ylim2_pgc_v2.R -i $infile -o $outfile -c $color -g $goodpv -h $highlightbp"
+ #qsub -lwalltime=00:25:00 scripts/qq_plot.pbs -e errandout/ -o errandout -d $workingdir -F "-s qq_plot.r -i "$study"_gemma_"$outname_append".p.gz -o "$study"_gemma_"$outname_append" -e 1"
+ bash scripts/mh_plot.pbs -s mh_plot_pgc_v2.R -m ManhattanPlotterFunction_colorfixed_max10ylim2_pgc_v2.R -i $infile -o $outfile -c $color -g $goodpv -h $highlightbp
+ bash scripts/qq_plot.pbs -s qq_plot.r -i "$study"_gemma_"$outname_append".p.gz -o "$study"_gemma_"$outname_append" -e 1
+
+ done
+ 
+ 

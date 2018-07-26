@@ -1,0 +1,74 @@
+#!/bin/bash
+
+while getopts l:d:p:c:g:n:j:k:m:u:x:a: option
+do
+  case "${option}"
+    in
+      l) doselist=${OPTARG};;
+      d) dosedir=${OPTARG};;
+      p) phenotype=${OPTARG};;
+      c) covariate=${OPTARG};;
+      g) grm=${OPTARG};;
+      n) nodeuse=${OPTARG};;
+      j) jobsize=${OPTARG};;
+      k) outname=${OPTARG};;
+      m) maf=${OPTARG};;
+      u) multivariate=${OPTARG};;
+      x) gxe=${OPTARG};;
+      a) chr=${OPTARG};;
+    esac
+done
+
+PBS_ARRAYID=$chr
+jobstart=$(($(($PBS_ARRAYID - 1))*$jobsize +1))
+jobstop=$(($jobstart + $jobsize - 1 ))
+
+max_jobs=$(wc -l $doselist | awk '{print $1}')
+
+ if [ $jobstop -ge $max_jobs ]
+ then
+  jobstop=$max_jobs
+ fi
+ 
+ if [ $multivariate != "no" ]
+ then
+  extraparms="-n $multivariate"
+ fi
+ 
+ if [ $gxe != "no" ]
+ then
+  extraparms_gxe="-gxe $gxe"
+ fi
+ 
+ 
+for job in $(seq  $jobstart $nodeuse $jobstop)
+do
+ jstart=$(($job))
+ 
+ jstop=$(($job+$nodeuse))
+ 
+ if [ $jstop -ge $jobstop ]
+ then
+  jstop=$jobstop
+ fi
+ 
+ for j in $(seq $jstart 1 $jstop)
+ do
+  file_use=$(awk -v lineno=$j '{if(NR==lineno) print}' $doselist)
+  grm_chr=$(echo $file_use | awk 'BEGIN{FS="_"} {print $2}' )
+  #mapfile=$(echo "$file_use"  | sed 's/.doscnt.gz/.mapfile.gz/g') 
+  
+  #only do analysis if the log file is incomplete, or if there is no log file
+  if [ -f output/"$file_use"_"$outname".log.txt ] 
+  then
+   if [ $(grep -c Computation  output/"$file_use"_"$outname".log.txt) -eq 0 ] 
+    then 
+    ./gemma -bfile "$dosedir"/"$file_use"  -p "$phenotype" -k "$grm""$grm_chr".rel -lmm 4 -maf $maf $extraparms $extraparms_gxe -c "$covariate" -o "$file_use"_"$outname" & 
+   fi
+  else
+    ./gemma -bfile "$dosedir"/"$file_use"  -p "$phenotype" -k "$grm""$grm_chr".rel -lmm 4 -maf $maf $extraparms $extraparms_gxe -c "$covariate" -o "$file_use"_"$outname" &
+  fi
+  
+  done
+ wait
+done 
